@@ -1,0 +1,209 @@
+# .github/workflows/shared-ci-get-pull-request-info.yml
+name: Get Pull Request Info
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: "Pull request number"
+        required: true
+        type: number
+      comment_body:
+        description: "Issue comment body"
+        required: true
+        type: string
+
+    outputs:
+      command:
+        description: "Parsed command from comment"
+        value: ${{ jobs.get_pr_info.outputs.command }}
+      base_ref:
+        description: "Base branch reference"
+        value: ${{ jobs.get_pr_info.outputs.base_ref }}
+      head_sha:
+        description: "Head commit SHA"
+        value: ${{ jobs.get_pr_info.outputs.head_sha }}
+      changed_files:
+        description: "List of changed files"
+        value: ${{ jobs.get_changed_files.outputs.all_changed_files }}
+      all_changed_stacks:
+        description: "List of changed stacks"
+        value: ${{ jobs.get_changed_files.outputs.all_changed_stacks }}
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  get_pr_info:
+    runs-on: ubuntu-latest
+    outputs:
+      command: ${{ steps.check-content.outputs.COMMAND }}
+      comment_changed_stacks: ${{ steps.check-content.outputs.comment_changed_stacks }}
+      base_ref: ${{ steps.get_pr_info.outputs.BASE_REF }}
+      base_sha: ${{ steps.get_pr_info.outputs.BASE_SHA }}
+      head_sha: ${{ steps.get_pr_info.outputs.HEAD_SHA }}
+    steps:
+      - name: Check if content is valid
+        id: check-content
+        run: |
+          comment_body="${{ inputs.comment_body }}"
+
+          # Parse command type with prefix matching
+          if [[ "$comment_body" == "iac terraform plan"* ]]; then
+              command="terraform plan"
+          elif [[ "$comment_body" == "iac terraform apply"* ]]; then
+              command="terraform apply"
+          else
+              echo "Error: Invalid command format. Expected command starting with 'iac terraform plan' or 'iac terraform apply'"
+              echo "Received: $comment_body"
+              exit 1
+          fi
+
+          # Extract profile parameter
+          if [[ "$comment_body" == *"-profile="* ]]; then
+              profile=$(echo "$comment_body" | sed -n 's/.*-profile=\([^ ]*\).*/\1/p')
+          else
+              profile=""
+          fi
+
+          # Extract stack parameter
+          if [[ "$comment_body" == *"-stack="* ]]; then
+              stack=$(echo "$comment_body" | sed -n 's/.*-stack=\([^ ]*\).*/\1/p')
+              # Remove leading/trailing whitespace, quotes, and other invalid characters
+              stack=$(echo "$stack" | xargs | tr -d '\"'"'"'\r\n')
+          else
+              stack=""
+          fi
+
+          all_changed_stacks="${profile}:${stack}"
+
+          echo "COMMAND=$command" >> $GITHUB_OUTPUT
+          echo "comment_changed_stacks: $all_changed_stacks"
+          echo "comment_changed_stacks=$all_changed_stacks" >> $GITHUB_OUTPUT
+         
+
+      - name: Get PR info
+        id: get_pr_info
+        run: |
+          pr_number="${{ inputs.pr_number }}"
+          echo "Fetching PR information for PR #$pr_number"
+          response=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/$pr_number")
+
+          mergeable=$(echo $response | jq -r '.mergeable')
+          if [ "$mergeable" != "true" ]; then
+              echo "Error: The PR is not mergeable (mergeable: $mergeable)"
+              echo "Please resolve conflicts and ensure the PR is ready for merge"
+              exit 1
+          fi
+
+          head_sha=$(echo "$response" | jq -r '.head.sha')
+          if [ -z "$head_sha" ] || [ "$head_sha" == "null" ]; then
+              echo "Error: Invalid or missing head_sha in PR response"
+              exit 1
+          fi
+
+          base_ref=$(echo "$response" | jq -r '.base.ref')
+          base_sha=$(echo "$response" | jq -r '.base.sha')
+          if [ -z "$base_ref" ] || [ "$base_ref" == "null" ]; then
+              echo "Error: Invalid or missing base_ref in PR response"
+              exit 1
+          fi
+          if [ -z "$base_sha" ] || [ "$base_sha" == "null" ]; then
+              echo "Error: Invalid or missing base_sha in PR response"
+              exit 1
+          fi
+
+          echo "PR Info - Number: $pr_number, Commit: $head_sha, Base: $base_ref ($base_sha)"
+
+          echo "HEAD_SHA=$head_sha" >> $GITHUB_OUTPUT
+          echo "BASE_REF=$base_ref" >> $GITHUB_OUTPUT
+          echo "BASE_SHA=$base_sha" >> $GITHUB_OUTPUT
+
+  get_changed_files:
+    needs: get_pr_info
+    runs-on: ubuntu-latest
+    outputs:
+      all_changed_files: ${{ steps.changed-files.outputs.all_changed_files }}
+      all_changed_stacks: ${{ steps.calculate-changed-stacks.outputs.all_changed_stacks }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.get_pr_info.outputs.head_sha }}
+
+      - name: Get changed files
+        id: changed-files
+        uses: ./.github/actions/changed-files
+        with:
+          sha: ${{ needs.get_pr_info.outputs.head_sha }}
+          base_sha: ${{ needs.get_pr_info.outputs.base_sha }}
+          separator: ","
+          files: |
+            **/*.yaml
+            **/*.json
+            **/*.tf
+
+      - name: Calculate changed stacks
+        id: calculate-changed-stacks
+        run: |
+          # Check if get_pr_info provided all_changed_stacks
+          pr_all_changed_stacks="${{ needs.get_pr_info.outputs.comment_changed_stacks }}"
+          
+          # If get_pr_info provided all_changed_stacks, use it directly
+          if [ -n "$pr_all_changed_stacks" ] && [ "$pr_all_changed_stacks" != ":" ]; then
+              echo "Using all_changed_stacks from PR comment: $pr_all_changed_stacks"
+              echo "all_changed_stacks=$pr_all_changed_stacks" >> $GITHUB_OUTPUT
+              exit 0
+          fi
+
+          all_changed_files="${{ steps.changed-files.outputs.all_changed_files }}"
+          echo "All changed files: $all_changed_files"
+          IFS=',' read -ra changed_files_array <<< "$all_changed_files"
+
+          profiles=()
+          stacks=()
+
+          for file in "${changed_files_array[@]}"; do
+              file=$(echo "$file" | xargs)
+
+              if [[ $file == deployments/* ]]; then
+                  path_without_prefix=${file#deployments/}
+                  
+                  profile_name=$(echo "$path_without_prefix" | cut -d'/' -f1)
+                  stack_name=$(echo "$path_without_prefix" | cut -d'/' -f2)
+                  
+                  index=-1
+                  for i in "${!profiles[@]}"; do
+                      if [[ "${profiles[i]}" == "$profile_name" ]]; then
+                          index=$i
+                          break
+                      fi
+                  done
+                  
+                  if [[ $index -eq -1 ]]; then
+                      profiles+=("$profile_name")
+                      stacks+=("$stack_name")
+                  else
+                      stacks[$index]="${stacks[$index]},$stack_name"
+                  fi
+              fi
+          done
+
+          if [ ${#profiles[@]} -eq 0 ]; then
+              echo "No deployments changes available, please specify profile and stack parameters" >&2
+              exit 1
+          fi
+
+          # Format output: profiles separated by ';', profile and stack separated by ':'
+          all_changed_stacks=""
+          for i in "${!profiles[@]}"; do
+              if [ -n "$all_changed_stacks" ]; then
+                  all_changed_stacks="${all_changed_stacks};${profiles[i]}:${stacks[i]}"
+              else
+                  all_changed_stacks="${profiles[i]}:${stacks[i]}"
+              fi
+          done
+
+          echo "all_changed_stacks: $all_changed_stacks"
+          echo "all_changed_stacks=$all_changed_stacks" >> $GITHUB_OUTPUT

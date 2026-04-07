@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_SCRIPT="$SCRIPT_DIR/yamlparser.py"
+
+if [[ ! -f "$PYTHON_SCRIPT" ]]; then
+    echo "Error: Python script '$PYTHON_SCRIPT' not found" >&2
+    exit 1
+fi
+
+if [[ ! -x "$PYTHON_SCRIPT" ]]; then
+    echo "Error: Python script '$PYTHON_SCRIPT' is not executable" >&2
+    exit 1
+fi
+
+if ! python3 -c "import yaml" 2>/dev/null; then
+    echo "Error: PyYAML module not installed. Please install it with: pip install PyYAML" >&2
+    exit 1
+fi
+
+if [[ $# -eq 0 ]]; then
+    echo "Usage: $0 <expression> <file>"
+    echo "   or: $0 eval <expression> <file>"
+    exit 1
+fi
+
+python3 "$PYTHON_SCRIPT" "$@"

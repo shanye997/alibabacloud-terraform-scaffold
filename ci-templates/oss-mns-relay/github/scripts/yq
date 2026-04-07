@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+
+# yq 命令的包装脚本，使用 Python 脚本实现相同功能
+
+# 获取脚本所在目录
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_SCRIPT="$SCRIPT_DIR/yaml_parser.py"
+
+# 确保 Python 脚本存在且可执行
+if [[ ! -f "$PYTHON_SCRIPT" ]]; then
+    echo "Error: Python script '$PYTHON_SCRIPT' not found" >&2
+    exit 1
+fi
+
+# 检查 Python 脚本是否可执行
+if [[ ! -x "$PYTHON_SCRIPT" ]]; then
+    echo "Error: Python script '$PYTHON_SCRIPT' is not executable" >&2
+    exit 1
+fi
+
+# 确保已安装 PyYAML
+if ! python3 -c "import yaml" 2>/dev/null; then
+    echo "Error: PyYAML module not installed. Please install it with: pip install PyYAML" >&2
+    exit 1
+fi
+
+# 检查参数
+if [[ $# -eq 0 ]]; then
+    echo "Usage: $0 <expression> <file>"
+    echo "   or: $0 eval <expression> <file>"
+    exit 1
+fi
+
+# 转发所有参数到 Python 脚本
+python3 "$PYTHON_SCRIPT" "$@"

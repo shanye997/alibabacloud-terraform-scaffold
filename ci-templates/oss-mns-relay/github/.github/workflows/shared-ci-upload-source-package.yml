@@ -1,0 +1,258 @@
+# .github/workflows/shared-ci-upload-source-package.yml
+name: Upload Source Package to OSS
+
+on:
+  workflow_call:
+    inputs:
+      base_ref:
+        required: true
+        type: string
+      head_sha:
+        required: true
+        type: string
+      profiles:
+        required: false
+        type: string
+      run_detect:
+        required: false
+        type: boolean
+        default: false
+      secrets_map:
+        required: false
+        type: string
+        description: "YAML string representing a map of secrets to be used in the workflow"
+      
+    outputs:
+      result_path:
+        description: "The log path of the execution result"
+        value: ${{ jobs.upload_source_package.outputs.result_path }}
+
+jobs:
+  upload_source_package:
+    runs-on: ubuntu-latest
+    outputs:
+      result_path: ${{ steps.upload_and_trigger.outputs.RESULT_PATH }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          path: code
+          ref: ${{ inputs.head_sha }}
+
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+        with:
+          path: governance
+          ref: main
+          sparse-checkout: |
+            scripts/upload_to_oss.py
+
+      - name: Setup Python environment
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install alibabacloud-oss-v2
+          # Install PyYAML if not already installed
+          pip install PyYAML
+      
+      - name: Process secrets map
+        if: ${{ inputs.secrets_map != '' }}
+        run: |
+          echo "Processing secrets map..."
+          # 将 secrets_map 保存到环境变量中
+          echo "SECRETS_MAP=${{ inputs.secrets_map }}" >> $GITHUB_ENV
+          
+          # 遍历 JSON 数据并设置各个 secrets 为环境变量
+          echo "${{ inputs.secrets_map }}" | jq -r 'to_entries[] | "\(.key)=\(.value)"' | while IFS= read -r line; do
+            echo "$line" >> $GITHUB_ENV
+          done
+
+      - name: Create source package and Upload to OSS
+        id: upload_and_trigger
+        env: 
+          DEV_ACCESS_KEY_ID: ${{ secrets.DEV_ACCESS_KEY_ID }}
+          DEV_ACCESS_KEY_SECRET: ${{ secrets.DEV_ACCESS_KEY_SECRET }}
+          PROD_ACCESS_KEY_ID: ${{ secrets.PROD_ACCESS_KEY_ID }}
+          PROD_ACCESS_KEY_SECRET: ${{ secrets.PROD_ACCESS_KEY_SECRET }}
+          STAGING_ACCESS_KEY_ID: ${{ secrets.STAGING_ACCESS_KEY_ID }}
+          STAGING_ACCESS_KEY_SECRET: ${{ secrets.STAGING_ACCESS_KEY_SECRET }}
+        run: |
+          echo "Creating source package..."
+
+          # Make yq script executable
+          chmod +x governance/scripts/yaml_parser.py
+          chmod +x governance/scripts/yq
+
+          # Create symlink to simulate yq command
+          mkdir -p ~/bin
+          cp governance/scripts/yq ~/bin/yq
+          cp governance/scripts/yaml_parser.py ~/bin/yaml_parser.py
+          export PATH="$HOME/bin:$PATH"
+          
+          profiles=${{ inputs.profiles }}
+          echo "Profiles: ${profiles}"
+          if [[ "$profiles" == "all" ]]; then
+              if [[ -d "code/deployments" ]]; then
+                  profile_list=()
+                  for dir in code/deployments/*/; do
+                      if [[ -d "$dir" ]]; then
+                          folder_name=$(basename "$dir")
+                          profile_list+=("$folder_name")
+                      fi
+                  done
+              else
+                  echo "Error: deployments directory not found" >&2
+                  exit 1
+              fi
+          else
+              IFS=',' read -ra profile_list <<< "$profiles"
+          fi
+          echo "Profiles to process: ${profile_list[*]}"
+          
+          result_path_list=()
+          failed_profiles=()
+
+          rootDir=$(pwd)
+          for profile in "${profile_list[@]}"; do
+            echo ""
+            echo "Processing profile: $profile"
+            codeDir="code-$profile"
+
+            cd $rootDir
+            mkdir $codeDir && cp -rp code/* $codeDir/
+            cd $codeDir
+
+            echo "Building package for profile: $profile"
+            make_output_file=$(mktemp)
+            make build-package PROFILE=$profile 2>&1 | tee "$make_output_file"
+            make_exit_code=${PIPESTATUS[0]}
+            make_output=$(cat "$make_output_file")
+            rm -f "$make_output_file"
+            if [ "$make_exit_code" -ne 0 ]; then
+              echo "Error: Failed to build package for profile: $profile"
+              failed_profiles+=("$profile")
+              continue
+            fi
+            hash=$(echo "$make_output" | grep -o "Hash: [a-f0-9]*" | awk '{print $2}')
+          
+
+            profile_file="stacks/profile.yaml"
+            # Check if profile file exists
+            if [ ! -f "$profile_file" ]; then
+              echo "Error: Profile file not found: $profile_file"
+              failed_profiles+=("$profile")
+              continue
+            fi
+
+            oss_region="cn-beijing"
+            oss_bucket=$(yq '.oss_bucket' "$profile_file")
+            access_key_id_name=$(yq '.access_key_id' "$profile_file")
+            access_key_secret_name=$(yq '.access_key_secret' "$profile_file")
+
+            # 从环境变量中获取，变量名与 access_key_id_name 和 access_key_secret_name 相同
+            access_key_id="${!access_key_id_name}"
+            access_key_secret="${!access_key_secret_name}"
+
+            if [ -z "$access_key_id" ] || [ -z "$access_key_secret" ]; then
+              echo "Error: Missing access key ID or access key secret"
+              failed_profiles+=("$profile")
+              continue
+            fi
+            export OSS_BUCKET=$oss_bucket OSS_REGION=$oss_region OSS_ACCESS_KEY_ID=$access_key_id OSS_ACCESS_KEY_SECRET=$access_key_secret
+        
+           
+            mv $codeDir.zip ../
+            cd ../
+            ls -all *.zip
+            
+            object_path="repositories/${{ github.repository }}/${{ inputs.base_ref }}"
+            code_path="${object_path}/code.zip"
+
+
+            echo "Uploading to OSS with key: $code_path"
+            # Use tee to display output in real-time while capturing it
+            output_file=$(mktemp)
+            python governance/scripts/upload_to_oss.py --key="$code_path" --file_path=$codeDir.zip --unique_key="$hash" 2>&1 | tee "$output_file"
+            upload_exit_code=${PIPESTATUS[0]}
+            output=$(cat "$output_file")
+            rm -f "$output_file"
+
+            if [ $upload_exit_code -ne 0 ]; then
+              echo "Error: Failed to upload to OSS for profile: $profile (exit code: $upload_exit_code)"
+              echo "Skipping remaining steps for profile: $profile, continuing with next profile..."
+              failed_profiles+=("$profile")
+              continue
+            fi
+
+            echo "INFO: Upload successfully"
+            version_id=$(echo "$output" | grep -o 'Version ID: [^,]*' | sed 's/.*Version ID: //')
+            if [ -z "$version_id" ]; then
+              echo "Warning: Could not extract version_id from output"
+              version_id=""
+            fi
+
+            # Create and upload trigger file if run_detect is true
+            if [ "${{ inputs.run_detect }}" == "true" ]; then
+              echo "Creating detect trigger file for profile: $profile"
+              
+              oss_path="oss::https://${oss_bucket}.oss-${oss_region}.aliyuncs.com"
+              code_path_full="${oss_path}/${code_path}"
+              trigger_file_name="Detect-${profile}-${{ github.run_number }}.json"
+              trigger_path="${object_path}/${trigger_file_name}"
+              result_path="${oss_path}/notifications/${{ github.repository }}/${{ inputs.base_ref }}/${trigger_file_name}"
+              trigger_id="${trigger_file_name%.json}"
+
+              echo "Creating detect trigger event file"
+              cat > trigger-event.json << EOF
+            {
+              "id": "${trigger_id}",
+              "action": "state detect",
+              "codeHeadSha": "${{ inputs.head_sha }}",
+              "codeVersionId": "${version_id}",
+              "codePackagePath": "${code_path_full}",
+              "execResultPath": "${result_path}",
+              "changedFolders": ""
+            }
+          EOF
+
+              echo "Trigger event file content:"
+              cat trigger-event.json
+              python governance/scripts/upload_to_oss.py --key=$trigger_path --file_path=trigger-event.json
+              trigger_exit_code=$?
+
+              if [ $trigger_exit_code -ne 0 ]; then
+                echo "Error: Failed to upload trigger file to OSS for profile: $profile"
+                echo "Skipping remaining steps for profile: $profile, continuing with next profile..."
+                failed_profiles+=("$profile")
+                continue
+              fi
+
+              echo "Detect trigger file uploaded successfully"
+              result_path_list+=("$profile@$result_path")
+            fi
+
+          done
+
+          # Output result paths if run_detect is true
+          if [ "${{ inputs.run_detect }}" == "true" ] && [ ${#result_path_list[@]} -gt 0 ]; then
+            result_path_list_final=$(IFS=';'; echo "${result_path_list[*]}")
+            echo "$result_path_list_final"
+            echo "RESULT_PATH=$result_path_list_final" >> $GITHUB_OUTPUT
+          fi
+
+           # Check if any profiles failed
+          if [ ${#failed_profiles[@]} -gt 0 ]; then
+            echo ""
+            echo "❌ Error: The following profiles failed to upload:"
+            for failed_profile in "${failed_profiles[@]}"; do
+              echo "  - $failed_profile"
+            done
+            exit 1
+          else
+            echo "All source package created and uploaded to OSS"
+          fi
+          

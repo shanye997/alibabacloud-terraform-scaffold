@@ -1,0 +1,56 @@
+format_version: IaCService/2021-08-06
+description: 创建开发和生产环境
+deployment:
+  - name: development
+    inputs:
+      region: "cn-shanghai"
+      name: "dev-app"
+      vpc_cidr_block: "192.168.0.0/16"
+      zones: ["cn-shanghai-b", "cn-shanghai-k"]
+      vswitch_cidrs: ["192.168.1.0/24", "192.168.2.0/24"]
+      instance_name: "server-dev"
+      instance_type: "ecs.c6.large"
+      image_id: "aliyun_3_x64_20G_qboot_alibase_20230727.vhd"
+      ingress_rules:
+        web:
+          ip_protocol: "tcp"
+          port_range: "80/80"
+          source_cidr: "0.0.0.0/0"
+        ssh:
+          ip_protocol: "tcp"
+          port_range: "22/22"
+          source_cidr: "192.168.0.0/16"
+      egress_rules:
+        all:
+          ip_protocol: "all"
+          port_range: "-1/-1"
+          dest_cidr: "0.0.0.0/0"
+      
+  - name: production
+    inputs:
+      region: "cn-beijing"
+      name: "prod-app"
+      vpc_cidr_block: "10.0.0.0/16"
+      zones: ["cn-beijing-l", "cn-beijing-k"]
+      vswitch_cidrs: ["10.0.1.0/24", "10.0.2.0/24"]
+      instance_name: "server-prod"
+      instance_type: "ecs.c6.xlarge"
+      image_id: "aliyun_3_x64_20G_qboot_alibase_20230727.vhd"
+      ingress_rules:
+        web:
+          ip_protocol: "tcp"
+          port_range: "80/80"
+          source_cidr: "0.0.0.0/0"
+        ssh:
+          ip_protocol: "tcp"
+          port_range: "22/22"
+          source_cidr: "10.0.0.0/16"
+      egress_rules:
+        https:
+          ip_protocol: "tcp"
+          port_range: "443/443"
+          dest_cidr: "0.0.0.0/0"
+        http:
+          ip_protocol: "tcp"
+          port_range: "80/80"
+          dest_cidr: "0.0.0.0/0"

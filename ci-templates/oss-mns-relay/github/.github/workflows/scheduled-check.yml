@@ -1,0 +1,82 @@
+# .github/workflows/scheduled-check.yml
+name: Scheduled Check
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_detect:
+        description: 'Whether to run detect check'
+        required: false
+        type: boolean
+        default: false
+  # schedule:
+  #   - cron: '0 0 * * *'  # Run daily at midnight UTC
+
+jobs:
+  process_code:
+    uses: ./.github/workflows/shared-ci-upload-source-package.yml
+    secrets: inherit
+    with:
+      base_ref: main
+      head_sha: ${{ github.sha }}
+      profiles: all
+      run_detect: ${{ inputs.run_detect || github.event_name == 'schedule' }}
+
+  get_exec_result:
+    if: ${{ (inputs.run_detect == true || github.event_name == 'schedule') && always() && needs.process_code.result }}
+    needs: process_code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          path: code
+          ref: ${{ github.sha }}
+
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+        with:
+          path: governance
+          ref: main
+          sparse-checkout: |
+            scripts/parse_exec_result.py
+
+      - name: Setup Python environment
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install alibabacloud-oss-v2
+          pip install PyYAML
+
+      - name: Get execution result
+        id: get_result
+        env: 
+          DEV_ACCESS_KEY_ID: ${{ secrets.DEV_ACCESS_KEY_ID }}
+          DEV_ACCESS_KEY_SECRET: ${{ secrets.DEV_ACCESS_KEY_SECRET }}
+          PROD_ACCESS_KEY_ID: ${{ secrets.PROD_ACCESS_KEY_ID }}
+          PROD_ACCESS_KEY_SECRET: ${{ secrets.PROD_ACCESS_KEY_SECRET }}
+          STAGING_ACCESS_KEY_ID: ${{ secrets.STAGING_ACCESS_KEY_ID }}
+          STAGING_ACCESS_KEY_SECRET: ${{ secrets.STAGING_ACCESS_KEY_SECRET }}
+        run: |
+          result_path="${{ needs.process_code.outputs.result_path }}"
+          
+          # Check if result_path is empty (process_code may have failed)
+          if [ -z "$result_path" ]; then
+            echo "⚠️  Warning: result_path is empty. process_code job may have failed."
+            echo "Skipping execution result retrieval."
+            exit 0
+          fi
+          
+          echo -n "${{ secrets.OSS_CREDENTIALS }}" > oss_credentials.yaml
+
+          ls -all
+         
+          # Run the script to get execution result
+          python governance/scripts/parse_exec_result.py \
+            --code-path="code" \
+            --oss-url="${result_path}" \
+            --output-file=execution_result.txt

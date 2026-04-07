@@ -1,0 +1,9 @@
+account_id: "1234567890123456"
+# OSS + MNS
+oss_bucket: "my-iac-bucket-account-B"
+oss_region: "cn-beijing"
+# Direct to IacService
+code_module_id: "mod-xxxx"
+access_key_id: ACCOUNT_B_ACCESS_KEY_ID
+access_key_secret: ACCOUNT_B_ACCESS_KEY_SECRET
+  

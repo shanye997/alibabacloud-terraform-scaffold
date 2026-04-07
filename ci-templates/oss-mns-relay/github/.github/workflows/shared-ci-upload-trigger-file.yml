@@ -1,0 +1,214 @@
+# .github/workflows/shared-ci-upload-trigger.yml
+name: Upload Trigger File to OSS
+
+on:
+  workflow_call:
+    inputs:
+      base_ref:
+        required: true
+        type: string
+      head_sha:
+        required: true
+        type: string
+      command:
+        required: true
+        type: string
+      all_changed_stacks:
+        required: true
+        type: string
+      trigger_file_name:
+        required: true
+        type: string
+
+    outputs:
+      result_path:
+        description: "The log path of the execution result"
+        value: ${{ jobs.create_comment_trigger.outputs.result_path }}
+
+jobs:
+  create_comment_trigger:
+    runs-on: ubuntu-latest
+    outputs:
+      result_path: ${{ steps.upload_trigger_event_file.outputs.RESULT_PATH }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          path: code
+          ref: ${{ inputs.head_sha }}
+
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+        with:
+          path: governance
+          ref: main
+          sparse-checkout: |
+            scripts/upload_to_oss.py
+
+      - name: Setup Python environment
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install alibabacloud-oss-v2
+
+      - name: Upload source package and trigger event file
+        id: upload_trigger_event_file
+        env: 
+          DEV_ACCESS_KEY_ID: ${{ secrets.DEV_ACCESS_KEY_ID }}
+          DEV_ACCESS_KEY_SECRET: ${{ secrets.DEV_ACCESS_KEY_SECRET }}
+          PROD_ACCESS_KEY_ID: ${{ secrets.PROD_ACCESS_KEY_ID }}
+          PROD_ACCESS_KEY_SECRET: ${{ secrets.PROD_ACCESS_KEY_SECRET }}
+          STAGING_ACCESS_KEY_ID: ${{ secrets.STAGING_ACCESS_KEY_ID }}
+          STAGING_ACCESS_KEY_SECRET: ${{ secrets.STAGING_ACCESS_KEY_SECRET }}
+        run: |
+          echo "Creating source package..."
+
+          # Make yq script executable
+          chmod +x governance/scripts/yaml_parser.py
+          chmod +x governance/scripts/yq
+
+          # Create symlink to simulate yq command
+          mkdir -p ~/bin
+          cp governance/scripts/yq ~/bin/yq
+          cp governance/scripts/yaml_parser.py ~/bin/yaml_parser.py
+          export PATH="$HOME/bin:$PATH"
+
+          input_profiles="${{ inputs.all_changed_stacks }}"
+          echo "Profiles: ${input_profiles}"
+          profile_list=()
+          stacks_list=()
+          IFS=';' read -ra profile_stacks <<< "$input_profiles"
+          for item in "${profile_stacks[@]}"; do
+              IFS=':' read -r profile stacks <<< "$item"
+              profile_list+=("$profile")
+              stacks_list+=("$stacks")
+          done
+          echo "Profiles to process: ${profile_list[*]}"
+          echo "Stacks to process: ${stacks_list[*]}"
+
+          version_ids_list=()
+          result_path_list=()
+          failed_profiles=()
+
+          while [[ $index -lt ${#profile_list[@]} ]]; do
+            profile="${profile_list[$index]}"
+
+            echo ""
+            echo "Processing profile: $profile"
+            codeDir="code-$profile"
+
+            mkdir $codeDir && cp -rp code/* $codeDir/
+            cd $codeDir
+
+            echo "Building package for profile: $profile"
+            make_output_file=$(mktemp)
+            make build-package PROFILE=$profile 2>&1 | tee "$make_output_file"
+            make_exit_code=${PIPESTATUS[0]}
+            make_output=$(cat "$make_output_file")
+            rm -f "$make_output_file"
+            if [ "$make_exit_code" -ne 0 ]; then
+              echo "Error: Failed to build package for profile: $profile"
+              exit 1
+            fi
+            hash=$(echo "$make_output" | grep -o "Hash: [a-f0-9]*" | awk '{print $2}')
+
+            profile_file="stacks/profile.yaml"
+            # Check if profile file exists
+            if [ ! -f "$profile_file" ]; then
+              echo "Error: Profile file not found: $profile_file"
+              exit 1
+            fi
+
+            oss_region="cn-beijing"
+            oss_bucket=$(yq '.oss_bucket' "$profile_file")
+            access_key_id_name=$(yq '.access_key_id' "$profile_file")
+            access_key_secret_name=$(yq '.access_key_secret' "$profile_file")
+
+            # 从环境变量中获取，变量名与 access_key_id_name 和 access_key_secret_name 相同
+            access_key_id="${!access_key_id_name}"
+            access_key_secret="${!access_key_secret_name}"
+            
+            if [ -z "$access_key_id" ] || [ -z "$access_key_secret" ]; then
+              echo "Error: Missing access key ID or access key secret"
+              exit 1
+            fi
+            export OSS_BUCKET=$oss_bucket OSS_REGION=$oss_region OSS_ACCESS_KEY_ID=$access_key_id OSS_ACCESS_KEY_SECRET=$access_key_secret
+
+           
+            mv $codeDir.zip ../
+            cd ../
+            ls -all *.zip
+
+
+            object_path="repositories/${{ github.repository }}/${{ inputs.base_ref }}"
+            code_path="${object_path}/code.zip"
+            trigger_file_name="${{ inputs.trigger_file_name }}"
+            trigger_path="${object_path}/${trigger_file_name}"
+            
+            
+            echo "Uploading to OSS with key: $code_path"
+            # Use tee to display output in real-time while capturing it
+            output_file=$(mktemp)
+            python governance/scripts/upload_to_oss.py --key="$code_path" --file_path=$codeDir.zip --unique_key="$hash" 2>&1 | tee "$output_file"
+            upload_exit_code=${PIPESTATUS[0]}
+            output=$(cat "$output_file")
+            rm -f "$output_file"
+
+            if [ "$upload_exit_code" -ne 0 ]; then
+              echo "Error: Failed to upload to OSS for profile: $profile (exit code: $upload_exit_code)"
+              exit 1
+            fi
+
+            echo "INFO: Upload successfully"
+            version_id=$(echo "$output" | grep -o 'Version ID: [^,]*' | sed 's/.*Version ID: //')
+            if [ -z "$version_id" ]; then
+              echo "Warning: Could not extract version_id from output"
+              version_id=""
+            fi
+
+            oss_path="oss::https://${oss_bucket}.oss-${oss_region}.aliyuncs.com"
+            code_path="${oss_path}/${code_path}"
+            result_path="${oss_path}/notifications/${{ github.repository }}/${{ inputs.base_ref }}/${trigger_file_name}"
+            trigger_id="${trigger_file_name%.json}"
+
+            stacks="${stacks_list[$index]}"
+            IFS=',' read -r -a stack_array <<< "$stacks"
+            result_array=()
+            for stack in "${stack_array[@]}"; do
+              if [[ "$stack" != */ ]]; then
+                  stack="${stack}/"
+              fi
+              result_array+=("stacks/${stack}")
+            done
+            stacks_final=$(IFS=','; echo "${result_array[*]}")
+            
+            echo "Creating trigger event file for command: ${{ inputs.command }}"
+            cat > trigger-event.json << EOF
+            {
+              "id": "${trigger_id}",
+              "action": "${{ inputs.command }}",
+              "codeHeadSha": "${{ inputs.head_sha }}",
+              "codeVersionId": "${version_id}",
+              "codePackagePath": "${code_path}",
+              "execResultPath": "${result_path}",
+              "changedFolders": "${stacks_final}"
+            }
+          EOF
+
+            echo "Trigger event file content:"
+            cat trigger-event.json
+            python governance/scripts/upload_to_oss.py --key=$trigger_path --file_path=trigger-event.json
+
+            result_path_list+=("$profile@$result_path")
+
+            index=$((index+1))
+          done
+
+          result_path_list_final=$(IFS=';'; echo "${result_path_list[*]}")
+          echo "$result_path_list_final"
+          echo "RESULT_PATH=$result_path_list_final" >> $GITHUB_OUTPUT
+          echo "All source package and trigger event file created and uploaded to OSS"

@@ -1,0 +1,84 @@
+format_version: IaCService/2021-08-06
+description: Demo Stack
+variable:
+  - name: region
+    type: string
+    default: "cn-beijing"
+  - name: name
+    type: string
+    description: "Resource name prefix"
+  - name: vpc_cidr_block
+    type: string
+    description: "VPC CIDR block"
+  - name: zones
+    type: list(string)
+    description: "List of availability zones"
+  - name: vswitch_cidrs
+    type: list(string)
+    description: "List of CIDR blocks for vSwitches"
+  - name: instance_name
+    type: string
+    description: "ECS instance name prefix"
+  - name: instance_type
+    type: string
+    description: "ECS instance type"
+  - name: image_id
+    type: string
+    description: "ECS instance image ID"
+  - name: ingress_rules
+    type: any
+    description: "Security group ingress rules (map of objects with ip_protocol, port_range, source_cidr, etc.)"
+    default: {}
+  - name: egress_rules
+    type: any
+    description: "Security group egress rules (map of objects with ip_protocol, port_range, dest_cidr, etc.)"
+    default: {}
+
+required_providers:
+  - name: alicloud
+    source: hashicorp/alicloud
+    version: "~> 1.251.0"
+
+provider:
+  - type: alicloud
+    name: this
+    config:
+      region: var.region
+
+component:
+  - name: multi-zone-ecs
+    source: "../../components/multi-zone-ecs"
+    inputs:
+      name:           var.name
+      vpc_cidr_block: var.vpc_cidr_block
+      zones:          var.zones
+      vswitch_cidrs:  var.vswitch_cidrs
+      instance_name:  var.instance_name
+      instance_type:  var.instance_type
+      image_id:       var.image_id
+      ingress_rules:  var.ingress_rules
+      egress_rules:   var.egress_rules
+    providers:
+      alicloud: provider.alicloud.this
+
+output:
+  - name: vpc_id
+    type: string
+    description: "The ID of the VPC"
+    value: component.multi-zone-ecs.vpc_id
+  - name: vswitch_ids
+    type: list(string)
+    description: "The IDs of the vSwitches"
+    value: component.multi-zone-ecs.vswitch_ids
+  - name: security_group_id
+    type: string
+    description: "The ID of the security group"
+    value: component.multi-zone-ecs.security_group_id
+  - name: ecs_instance_ids
+    type: map(string)
+    description: "Map of ECS instance IDs"
+    value: component.multi-zone-ecs.ecs_instance_ids
+  - name: ecs_private_ips
+    type: map(string)
+    description: "Map of ECS instance private IPs"
+    value: component.multi-zone-ecs.ecs_private_ips
